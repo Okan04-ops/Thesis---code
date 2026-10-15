@@ -1,0 +1,1439 @@
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+
+import csv
+import math
+import os
+import threading
+import queue
+import time
+
+from collections import deque
+from datetime import datetime
+
+import serial
+from serial.tools import list_ports
+
+import numpy as np
+
+import matplotlib
+matplotlib.use("TkAgg")
+
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+
+# ============================================================
+# НАСТРОЙКИ
+# ============================================================
+
+DEFAULT_PORT = "COM3"
+DEFAULT_BAUD = 230400
+
+DEFAULT_SAVE_FOLDER = os.path.join(
+    os.path.expanduser("~"), "Documents", "MultiSensorData"
+)
+
+WINDOW_SECONDS = 60
+RAW_SAMPLE_RATE = 50          # трябва да съвпада с Arduino (500 Hz / 10)
+PLOT_FPS = 10
+
+# Забавяне на показването: графиките и числата показват данните
+# от преди DISPLAY_DELAY_S секунди (0 = без забавяне).
+DISPLAY_DELAY_S = 1.0
+
+RAW_DROP_THRESHOLD = 50
+
+MAX_SLOW_POINTS = WINDOW_SECONDS * 10
+MAX_NIR_POINTS = WINDOW_SECONDS * 50
+
+# Колко секунди се държи последната стойност в картите (после "--")
+VALUE_HOLD_S = 10.0
+
+# Корекция на времето на семплите (изглажда забавянията на USB)
+CLOCK_GAIN = 0.02
+
+# Минимален размер на Y оста
+MIN_SPAN_IBI = 100.0      # ms
+MIN_SPAN_BPM = 10.0       # BPM
+MIN_SPAN_NIR = 4.0        # единици
+
+# --- Детекция на пулс (прави се в Python) ---
+MIN_BPM = 40
+MAX_BPM = 180
+MIN_IBI_MS = 60000.0 / MAX_BPM      # ~333 ms
+MAX_IBI_MS = 60000.0 / MIN_BPM      # 1500 ms
+MIN_AMPLITUDE = 10.0                # минимална амплитуда на пулсовата вълна
+ARTIFACT_LIMIT = 250.0              # по-големи скокове = движение на пръста
+SATURATION_LEVEL = 1015             # сензорът е наситен
+ARTIFACT_BLOCK_S = 1.5              # игнориране на сигнала след артефакт
+SETTLE_S = 2.0                      # време за установяване на филтрите
+
+
+# ============================================================
+# ЦВЕТОВЕ / ГРАФИЧЕН СТИЛ
+# ============================================================
+
+BG = "#0d1117"
+PANEL = "#161b22"
+PANEL_LIGHT = "#21262d"
+PLOT_BG = "#0f141a"
+BORDER = "#30363d"
+
+TEXT = "#e6edf3"
+MUTED = "#8b949e"
+
+GREEN = "#3fb950"
+RED = "#f85149"
+BLUE = "#58a6ff"
+PURPLE = "#bc8cff"
+ORANGE = "#d29922"
+CYAN = "#39d0d8"
+
+
+# ============================================================
+# ДЕТЕКТОР НА УДАРИ (PPG -> IBI -> BPM)
+# ============================================================
+
+class PulseDetector:
+    """
+    1. Лентов филтър: изглаждане (~4 Hz) минус бавна базова линия (~0.4 Hz).
+    2. Адаптивен праг = 50% от скорошната амплитуда (не под MIN_AMPLITUDE).
+    3. Пик = локален максимум над прага.
+    4. Всеки валиден удар дава IBI. Липсващ удар (интервал ~2x по-дълъг)
+       се записва като един нормален интервал, а излишни пикове се пропускат,
+       така че серията не се къса.
+    5. BPM = 60000 / медиана на последните интервали.
+    """
+
+    def __init__(self, fs):
+        self.fs = float(fs)
+        self.a_lp = 1.0 - math.exp(-2.0 * math.pi * 4.0 / self.fs)
+        self.a_base = 1.0 - math.exp(-2.0 * math.pi * 0.4 / self.fs)
+        self.env_decay = 0.78 ** (1.0 / self.fs)
+        self.reset()
+
+    def reset(self):
+        self.lp1 = None
+        self.lp2 = None
+        self.base = None
+        self.env = 0.0
+        self.prev2 = 0.0
+        self.prev1 = 0.0
+        self.prev1_t = 0.0
+        self.samples = 0
+        self.blocked_until = 0.0
+        self.last_peak_t = None
+        self.ibis = deque(maxlen=8)
+        self.rejects = 0
+
+    def update(self, x, t):
+        """Връща None или (време_на_пика, ibi_ms, bpm)."""
+        if self.lp1 is None:
+            self.lp1 = self.lp2 = self.base = float(x)
+
+        self.lp1 += self.a_lp * (x - self.lp1)
+        self.lp2 += self.a_lp * (self.lp1 - self.lp2)
+        self.base += self.a_base * (x - self.base)
+
+        ac = self.lp2 - self.base
+        self.samples += 1
+
+        # Движение / насищане: кратко игнориране, историята на ритъма се пази
+        if x >= SATURATION_LEVEL or abs(ac) > ARTIFACT_LIMIT:
+            self.blocked_until = t + ARTIFACT_BLOCK_S
+            self.env = 0.0
+            self.last_peak_t = None
+
+        positive = min(max(ac, 0.0), ARTIFACT_LIMIT)
+        self.env = max(positive, self.env * self.env_decay)
+        threshold = max(0.5 * self.env, MIN_AMPLITUDE)
+
+        result = None
+
+        if (
+            t >= self.blocked_until
+            and self.samples > self.fs * SETTLE_S
+            and self.prev1 > threshold
+            and self.prev1 >= self.prev2
+            and self.prev1 > ac
+        ):
+            result = self.register_peak(self.prev1_t)
+
+        self.prev2 = self.prev1
+        self.prev1 = ac
+        self.prev1_t = t
+
+        return result
+
+    def register_peak(self, peak_t):
+        if self.last_peak_t is None:
+            self.last_peak_t = peak_t
+            return None
+
+        ibi = (peak_t - self.last_peak_t) * 1000.0
+
+        # Твърде рано (шум / дикротичен пик) - пропускаме пика
+        if ibi < MIN_IBI_MS:
+            return None
+
+        if len(self.ibis) >= 3:
+            median = float(np.median(self.ibis))
+
+            if ibi < 0.65 * median:
+                return None
+
+            if ibi > 1.5 * median:
+                k = int(round(ibi / median))
+
+                if 2 <= k <= 4 and abs(ibi / k - median) < 0.25 * median:
+                    ibi = ibi / k          # пропуснат удар -> един интервал
+                else:
+                    self.rejects += 1
+                    self.last_peak_t = peak_t
+
+                    if self.rejects >= 3:  # вероятно нов ритъм
+                        self.ibis.clear()
+                        self.rejects = 0
+
+                    return None
+
+        if ibi > MAX_IBI_MS:
+            self.last_peak_t = peak_t
+            return None
+
+        self.rejects = 0
+        self.ibis.append(ibi)
+        self.last_peak_t = peak_t
+
+        return peak_t, ibi, self.current_bpm()
+
+    def current_bpm(self):
+        recent = list(self.ibis)[-5:]
+        return 60000.0 / float(np.median(recent))
+
+
+# ============================================================
+# БУФЕРИ ЗА ТРИТЕ PULSE SENSOR СЕНЗОРА
+# ============================================================
+
+def create_pulse_buffer():
+    return {
+        "raw_time": deque(maxlen=200),
+        "raw_data": deque(maxlen=200),
+
+        "ibi_time": deque(maxlen=MAX_SLOW_POINTS),
+        "ibi_data": deque(maxlen=MAX_SLOW_POINTS),
+
+        "bpm_time": deque(maxlen=MAX_SLOW_POINTS),
+        "bpm_data": deque(maxlen=MAX_SLOW_POINTS),
+
+        # натрупани суми за средно аритметично от началото до сега
+        "raw_sum": 0.0, "raw_count": 0,
+        "ibi_sum": 0.0, "ibi_count": 0,
+        "bpm_sum": 0.0, "bpm_count": 0,
+
+        "last_good_raw": None,
+        "clock": None,
+
+        "detector": PulseDetector(RAW_SAMPLE_RATE),
+
+        # пълен запис за Excel (само ако е включен)
+        "log_raw": [],
+        "log_beats": [],
+    }
+
+
+pulse_buffers = {
+    "pulse1": create_pulse_buffer(),
+    "pulse2": create_pulse_buffer(),
+    "pulse3": create_pulse_buffer(),
+}
+
+
+# ============================================================
+# NIR БУФЕР
+# ============================================================
+
+nir_time = deque(maxlen=MAX_NIR_POINTS)
+nir_data = deque(maxlen=MAX_NIR_POINTS)
+nir_log = []
+
+
+# ============================================================
+# ОБЩИ ФУНКЦИИ
+# ============================================================
+
+def get_available_ports():
+    try:
+        ports = [port.device for port in list_ports.comports()]
+    except Exception:
+        ports = []
+
+    if not ports:
+        ports = [f"COM{i}" for i in range(3, 16)]
+
+    return sorted(ports)
+
+
+def get_window_limits(now, seconds):
+    if now < seconds:
+        return 0.0, seconds
+
+    return now - seconds, now
+
+
+def latest_point(times, values, view_now):
+    """Последната точка с време <= view_now, или (None, None)."""
+    for i in range(len(times) - 1, -1, -1):
+        if times[i] <= view_now:
+            return times[i], values[i]
+
+    return None, None
+
+
+def autoscale_y(axis, values, min_span, pad=0.15):
+    """Мащабира Y оста към видимите данни, така че вълните да се виждат."""
+    data = np.asarray(values, dtype=float)
+    data = data[np.isfinite(data)]
+
+    if len(data) == 0:
+        return
+
+    low = float(data.min())
+    high = float(data.max())
+
+    span = max(high - low, min_span)
+    center = (high + low) / 2.0
+    half = span * (0.5 + pad)
+
+    axis.set_ylim(center - half, center + half)
+
+
+def excel_is_available():
+    try:
+        import openpyxl  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+# ============================================================
+# ГЛАВНО ПРИЛОЖЕНИЕ
+# ============================================================
+
+class MultiSensorMonitor:
+
+    def __init__(self, root):
+        self.root = root
+        self.root.withdraw()
+
+        self.serial_connection = None
+        self.reader_thread = None
+
+        self.stop_event = threading.Event()
+        self.line_queue = queue.Queue()
+
+        self.start_time = 0.0
+        self.closing = False
+
+        self.pulse_windows = {}
+
+        self.control_window = None
+        self.control_height = 240
+        self.nir_window = None
+
+        # запис на файлове
+        self.save_enabled = False
+        self.save_folder = ""
+        self.excel_available = False
+        self.session_stamp = ""
+
+        self.setup_window()
+
+    # ========================================================
+    # НАЧАЛЕН ПРОЗОРЕЦ: COM ПОРТ + ЗАПИС В EXCEL
+    # ========================================================
+
+    def setup_window(self):
+        self.setup = tk.Toplevel(self.root)
+
+        self.setup.title("Multi Sensor Monitor - Connection")
+        self.setup.geometry("560x590")
+        self.setup.resizable(False, False)
+        self.setup.configure(bg=BG)
+        self.setup.protocol("WM_DELETE_WINDOW", self.close_application)
+
+        tk.Label(
+            self.setup, text="MULTI SENSOR MONITOR",
+            bg=BG, fg=TEXT, font=("Segoe UI", 21, "bold")
+        ).pack(pady=(26, 4))
+
+        tk.Label(
+            self.setup,
+            text="3 Pulse Sensor прозореца и AS7341 NIR прозорец",
+            bg=BG, fg=MUTED, font=("Segoe UI", 10)
+        ).pack(pady=(0, 18))
+
+        # ---------------- връзка ----------------
+
+        form = tk.Frame(
+            self.setup, bg=PANEL,
+            highlightbackground=BORDER, highlightthickness=1
+        )
+        form.pack(padx=35, fill="x")
+        form.columnconfigure(1, weight=1)
+
+        tk.Label(
+            form, text="COM порт",
+            bg=PANEL, fg=TEXT, font=("Segoe UI", 10)
+        ).grid(row=0, column=0, padx=18, pady=(20, 10), sticky="w")
+
+        self.port_var = tk.StringVar(value=DEFAULT_PORT)
+
+        ports = get_available_ports()
+        if DEFAULT_PORT not in ports:
+            ports.insert(0, DEFAULT_PORT)
+
+        self.port_combo = ttk.Combobox(
+            form, textvariable=self.port_var,
+            values=ports, state="readonly", width=22
+        )
+        self.port_combo.grid(
+            row=0, column=1, padx=(5, 5), pady=(20, 10), sticky="ew"
+        )
+
+        tk.Button(
+            form, text="⟳", command=self.refresh_ports,
+            bg=PANEL_LIGHT, fg=TEXT,
+            activebackground=BORDER, activeforeground=TEXT,
+            relief="flat", font=("Segoe UI", 11), width=3, cursor="hand2"
+        ).grid(row=0, column=2, padx=(0, 18), pady=(20, 10))
+
+        tk.Label(
+            form, text="Baud rate",
+            bg=PANEL, fg=TEXT, font=("Segoe UI", 10)
+        ).grid(row=1, column=0, padx=18, pady=(10, 20), sticky="w")
+
+        self.baud_var = tk.StringVar(value=str(DEFAULT_BAUD))
+
+        ttk.Combobox(
+            form, textvariable=self.baud_var,
+            values=["9600", "19200", "38400", "57600", "115200", "230400"],
+            state="readonly", width=22
+        ).grid(
+            row=1, column=1, columnspan=2,
+            padx=(5, 18), pady=(10, 20), sticky="ew"
+        )
+
+        # ---------------- запис в Excel ----------------
+
+        save_frame = tk.Frame(
+            self.setup, bg=PANEL,
+            highlightbackground=BORDER, highlightthickness=1
+        )
+        save_frame.pack(padx=35, pady=(14, 0), fill="x")
+        save_frame.columnconfigure(0, weight=1)
+
+        self.save_var = tk.BooleanVar(value=False)
+        self.folder_var = tk.StringVar(value=DEFAULT_SAVE_FOLDER)
+
+        tk.Checkbutton(
+            save_frame,
+            text="Запази данните в Excel файл (.xlsx)",
+            variable=self.save_var,
+            command=self.toggle_save_options,
+            bg=PANEL, fg=TEXT,
+            activebackground=PANEL, activeforeground=TEXT,
+            selectcolor="#c9d1d9",
+            font=("Segoe UI", 10, "bold"),
+            cursor="hand2", anchor="w"
+        ).grid(
+            row=0, column=0, columnspan=2,
+            padx=14, pady=(14, 6), sticky="w"
+        )
+
+        tk.Label(
+            save_frame, text="Папка за запис:",
+            bg=PANEL, fg=MUTED, font=("Segoe UI", 9)
+        ).grid(row=1, column=0, columnspan=2, padx=18, sticky="w")
+
+        self.folder_entry = tk.Entry(
+            save_frame, textvariable=self.folder_var,
+            bg=PANEL_LIGHT, fg=TEXT, insertbackground=TEXT,
+            disabledbackground=PANEL, disabledforeground=MUTED,
+            relief="flat", font=("Segoe UI", 9)
+        )
+        self.folder_entry.grid(
+            row=2, column=0, padx=(18, 6), pady=(4, 16),
+            ipady=5, sticky="ew"
+        )
+
+        self.folder_button = tk.Button(
+            save_frame, text="Избери папка…",
+            command=self.browse_folder,
+            bg=PANEL_LIGHT, fg=TEXT,
+            activebackground=BORDER, activeforeground=TEXT,
+            relief="flat", font=("Segoe UI", 9), cursor="hand2"
+        )
+        self.folder_button.grid(
+            row=2, column=1, padx=(0, 18), pady=(4, 16), ipady=3
+        )
+
+        self.toggle_save_options()
+
+        # ---------------- свързване ----------------
+
+        tk.Button(
+            self.setup, text="СВЪРЖИ СЕ", command=self.connect,
+            bg=GREEN, fg="#08120a",
+            activebackground="#56d364", activeforeground="#08120a",
+            relief="flat", font=("Segoe UI", 11, "bold"),
+            height=2, cursor="hand2"
+        ).pack(padx=35, pady=(20, 8), fill="x")
+
+        tk.Label(
+            self.setup,
+            text="Изберете същия baud rate, който е зададен в Arduino кода.",
+            bg=BG, fg=MUTED, font=("Segoe UI", 8)
+        ).pack(pady=(4, 0))
+
+    def toggle_save_options(self):
+        state = "normal" if self.save_var.get() else "disabled"
+        self.folder_entry.configure(state=state)
+        self.folder_button.configure(state=state)
+
+    def browse_folder(self):
+        start = self.folder_var.get().strip()
+
+        if not start or not os.path.isdir(start):
+            start = os.path.expanduser("~")
+
+        folder = filedialog.askdirectory(
+            parent=self.setup,
+            initialdir=start,
+            title="Изберете папка за запис на данните"
+        )
+
+        if folder:
+            self.folder_var.set(os.path.normpath(folder))
+
+    def refresh_ports(self):
+        ports = get_available_ports()
+        current_port = self.port_var.get()
+
+        if current_port not in ports:
+            ports.insert(0, current_port)
+
+        self.port_combo["values"] = ports
+
+    # ========================================================
+    # СВЪРЗВАНЕ КЪМ ARDUINO
+    # ========================================================
+
+    def connect(self):
+        port = self.port_var.get()
+
+        try:
+            baud = int(self.baud_var.get())
+        except ValueError:
+            messagebox.showerror(
+                "Невалиден baud rate",
+                "Изберете валидна serial скорост.",
+                parent=self.setup
+            )
+            return
+
+        # ---- проверка на настройките за запис ----
+
+        save_enabled = bool(self.save_var.get())
+        save_folder = ""
+        excel_available = False
+
+        if save_enabled:
+            save_folder = self.folder_var.get().strip()
+
+            if not save_folder:
+                messagebox.showerror(
+                    "Липсва папка",
+                    "Изберете папка, в която да се запишат данните.",
+                    parent=self.setup
+                )
+                return
+
+            try:
+                os.makedirs(save_folder, exist_ok=True)
+            except Exception as error:
+                messagebox.showerror(
+                    "Папката не може да се използва",
+                    f"{save_folder}\n\n{error}",
+                    parent=self.setup
+                )
+                return
+
+            excel_available = excel_is_available()
+
+            if not excel_available:
+                use_csv = messagebox.askyesno(
+                    "Липсва библиотеката openpyxl",
+                    (
+                        "За запис в .xlsx е нужна библиотеката openpyxl:\n\n"
+                        "    pip install openpyxl\n\n"
+                        "Да продължа ли със запис в CSV файл "
+                        "(отваря се в Excel)?"
+                    ),
+                    parent=self.setup
+                )
+
+                if not use_csv:
+                    return
+
+        # ---- отваряне на serial порта ----
+
+        try:
+            self.serial_connection = serial.Serial(
+                port=port, baudrate=baud, timeout=0.1
+            )
+        except Exception as error:
+            messagebox.showerror(
+                "Грешка при свързване",
+                f"Не може да се отвори {port}.\n\n{error}",
+                parent=self.setup
+            )
+            return
+
+        self.save_enabled = save_enabled
+        self.save_folder = save_folder
+        self.excel_available = excel_available
+        self.session_stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        self.control_height = 330 if save_enabled else 240
+
+        self.start_time = time.time()
+
+        self.setup.destroy()
+
+        self.create_control_window(port, baud)
+
+        self.create_pulse_window("pulse1", "Pulse Sensor 1", BLUE)
+        self.create_pulse_window("pulse2", "Pulse Sensor 2", PURPLE)
+        self.create_pulse_window("pulse3", "Pulse Sensor 3", ORANGE)
+
+        self.create_nir_window()
+
+        self.root.after(250, self.arrange_sensor_windows)
+
+        self.stop_event.clear()
+
+        self.reader_thread = threading.Thread(
+            target=self.serial_reader, daemon=True
+        )
+        self.reader_thread.start()
+
+        self.root.after(10, self.process_serial_queue)
+        self.root.after(100, self.update_gui)
+
+    # ========================================================
+    # КОНТРОЛЕН ПРОЗОРЕЦ
+    # ========================================================
+
+    def create_control_window(self, port, baud):
+        self.control_window = tk.Toplevel(self.root)
+
+        self.control_window.title("Multi Sensor Monitor - Control")
+        self.control_window.geometry(f"430x{self.control_height}")
+        self.control_window.resizable(False, False)
+        self.control_window.configure(bg=BG)
+        self.control_window.protocol("WM_DELETE_WINDOW", self.close_application)
+
+        tk.Label(
+            self.control_window, text="MULTI SENSOR MONITOR",
+            bg=BG, fg=TEXT, font=("Segoe UI", 17, "bold")
+        ).pack(pady=(20, 4))
+
+        self.connection_var = tk.StringVar(value=f"Свързан: {port} @ {baud}")
+
+        tk.Label(
+            self.control_window, textvariable=self.connection_var,
+            bg=BG, fg=GREEN, font=("Segoe UI", 10)
+        ).pack(pady=4)
+
+        tk.Label(
+            self.control_window,
+            text=(
+                "Автоматично разположение:\n"
+                "горе: Pulse 1 / Pulse 2\n"
+                "долу: Pulse 3 / AS7341 NIR\n"
+                f"Забавяне на показването: {DISPLAY_DELAY_S:.1f} s"
+            ),
+            bg=BG, fg=MUTED, font=("Segoe UI", 10), justify="center"
+        ).pack(pady=(8, 10))
+
+        if self.save_enabled:
+            kind = "Excel (.xlsx)" if self.excel_available else "CSV"
+
+            tk.Label(
+                self.control_window,
+                text=f"Запис: {kind}\n{self.save_folder}",
+                bg=BG, fg=CYAN, font=("Segoe UI", 9),
+                wraplength=380, justify="center"
+            ).pack(pady=(0, 8))
+
+            tk.Button(
+                self.control_window, text="ЗАПАЗИ СЕГА",
+                command=self.save_now,
+                bg=PANEL_LIGHT, fg=TEXT,
+                activebackground=BORDER, activeforeground=TEXT,
+                relief="flat", font=("Segoe UI", 10, "bold"),
+                height=1, cursor="hand2"
+            ).pack(padx=35, pady=(0, 8), fill="x")
+
+        tk.Button(
+            self.control_window, text="ЗАТВОРИ ВСИЧКО",
+            command=self.close_application,
+            bg=RED, fg=TEXT,
+            activebackground="#ff7b72", activeforeground="#111111",
+            relief="flat", font=("Segoe UI", 10, "bold"),
+            height=2, cursor="hand2"
+        ).pack(padx=35, fill="x")
+
+    # ========================================================
+    # PULSE SENSOR ПРОЗОРЕЦ
+    # ========================================================
+
+    def create_pulse_window(self, sensor_name, window_title, accent_color):
+        window = tk.Toplevel(self.root)
+
+        window.title(window_title)
+        window.geometry("850x600")
+        window.minsize(520, 400)
+        window.configure(bg=PANEL)
+        window.protocol("WM_DELETE_WINDOW", self.close_application)
+
+        window.grid_rowconfigure(1, weight=1)
+        window.grid_columnconfigure(0, weight=1)
+
+        header = tk.Frame(window, bg=PANEL)
+        header.grid(row=0, column=0, sticky="ew", padx=15, pady=(12, 7))
+        header.grid_columnconfigure(1, weight=1)
+
+        tk.Label(
+            header, text=window_title.upper(),
+            bg=PANEL, fg=TEXT, font=("Segoe UI", 13, "bold")
+        ).grid(row=0, column=0, sticky="w")
+
+        metrics = tk.Frame(header, bg=PANEL)
+        metrics.grid(row=0, column=1, sticky="e")
+
+        bpm_var = tk.StringVar(value="--")
+        ibi_var = tk.StringVar(value="--")
+        raw_var = tk.StringVar(value="--")
+
+        self.create_metric_card(
+            metrics, "СРЕДЕН BPM", bpm_var, "BPM", accent_color, 4
+        ).pack(side="left", padx=3)
+
+        self.create_metric_card(
+            metrics, "СРЕДЕН IBI", ibi_var, "ms", TEXT, 5
+        ).pack(side="left", padx=3)
+
+        self.create_metric_card(
+            metrics, "СРЕДЕН RAW", raw_var, "", CYAN, 4
+        ).pack(side="left", padx=3)
+
+        figure = Figure(figsize=(8, 5), dpi=100, facecolor=PANEL)
+
+        ibi_axis = figure.add_subplot(211)
+        bpm_axis = figure.add_subplot(212)
+
+        figure.subplots_adjust(
+            left=0.10, right=0.97, top=0.94, bottom=0.10, hspace=0.42
+        )
+
+        canvas = FigureCanvasTkAgg(figure, master=window)
+        canvas.get_tk_widget().grid(
+            row=1, column=0, sticky="nsew", padx=8, pady=(0, 8)
+        )
+
+        self.pulse_windows[sensor_name] = {
+            "window": window,
+            "accent_color": accent_color,
+            "bpm_var": bpm_var,
+            "ibi_var": ibi_var,
+            "raw_var": raw_var,
+            "figure": figure,
+            "ibi_axis": ibi_axis,
+            "bpm_axis": bpm_axis,
+            "canvas": canvas,
+        }
+
+    # ========================================================
+    # NIR ПРОЗОРЕЦ
+    # ========================================================
+
+    def create_nir_window(self):
+        self.nir_window = tk.Toplevel(self.root)
+
+        self.nir_window.title("AS7341 NIR Sensor")
+        self.nir_window.geometry("850x600")
+        self.nir_window.minsize(520, 400)
+        self.nir_window.configure(bg=PANEL)
+        self.nir_window.protocol("WM_DELETE_WINDOW", self.close_application)
+
+        self.nir_window.grid_rowconfigure(1, weight=1)
+        self.nir_window.grid_columnconfigure(0, weight=1)
+
+        header = tk.Frame(self.nir_window, bg=PANEL)
+        header.grid(row=0, column=0, sticky="ew", padx=15, pady=(12, 7))
+        header.grid_columnconfigure(1, weight=1)
+
+        tk.Label(
+            header, text="AS7341 NIR SENSOR",
+            bg=PANEL, fg=TEXT, font=("Segoe UI", 13, "bold")
+        ).grid(row=0, column=0, sticky="w")
+
+        self.nir_value_var = tk.StringVar(value="--")
+
+        self.create_metric_card(
+            header, "NIR СТОЙНОСТ", self.nir_value_var, "", CYAN, 5
+        ).grid(row=0, column=1, sticky="e")
+
+        self.nir_figure = Figure(figsize=(8, 5), dpi=100, facecolor=PANEL)
+        self.nir_axis = self.nir_figure.add_subplot(111)
+
+        self.nir_figure.subplots_adjust(
+            left=0.10, right=0.97, top=0.93, bottom=0.12
+        )
+
+        self.nir_canvas = FigureCanvasTkAgg(
+            self.nir_figure, master=self.nir_window
+        )
+        self.nir_canvas.get_tk_widget().grid(
+            row=1, column=0, sticky="nsew", padx=8, pady=(0, 8)
+        )
+
+    # ========================================================
+    # METRIC CARD (с фиксирана ширина - без "подскачане")
+    # ========================================================
+
+    def create_metric_card(
+        self, parent, title, variable, unit, value_color, value_width
+    ):
+        card = tk.Frame(
+            parent, bg=PANEL_LIGHT,
+            highlightbackground=BORDER, highlightthickness=1
+        )
+
+        tk.Label(
+            card, text=title,
+            bg=PANEL_LIGHT, fg=MUTED, font=("Segoe UI", 8)
+        ).pack(anchor="w", padx=10, pady=(6, 0))
+
+        value_frame = tk.Frame(card, bg=PANEL_LIGHT)
+        value_frame.pack(anchor="w", padx=10, pady=(0, 6))
+
+        tk.Label(
+            value_frame, textvariable=variable, width=value_width,
+            anchor="w",
+            bg=PANEL_LIGHT, fg=value_color, font=("Segoe UI", 15, "bold")
+        ).pack(side="left")
+
+        if unit:
+            tk.Label(
+                value_frame, text=unit,
+                bg=PANEL_LIGHT, fg=MUTED, font=("Segoe UI", 8)
+            ).pack(side="left", padx=(2, 0), pady=(6, 0))
+
+        return card
+
+    # ========================================================
+    # АВТОМАТИЧНО ПОДРЕЖДАНЕ 2 x 2
+    # ========================================================
+
+    def arrange_sensor_windows(self):
+        self.root.update_idletasks()
+
+        screen_width = self.root.winfo_screenwidth()
+        screen_height = self.root.winfo_screenheight()
+
+        taskbar_reserve = 90
+        usable_width = screen_width
+        usable_height = screen_height - taskbar_reserve
+
+        margin = 6
+        gap = 8
+
+        cell_width = (usable_width - 2 * margin - gap) // 2
+        cell_height = (usable_height - 2 * margin - gap) // 2
+
+        x_left = margin
+        x_right = margin + cell_width + gap
+        y_top = margin
+        y_bottom = margin + cell_height + gap
+
+        size = f"{cell_width}x{cell_height}"
+
+        self.pulse_windows["pulse1"]["window"].geometry(
+            f"{size}+{x_left}+{y_top}"
+        )
+        self.pulse_windows["pulse2"]["window"].geometry(
+            f"{size}+{x_right}+{y_top}"
+        )
+        self.pulse_windows["pulse3"]["window"].geometry(
+            f"{size}+{x_left}+{y_bottom}"
+        )
+        self.nir_window.geometry(f"{size}+{x_right}+{y_bottom}")
+
+        control_width = 430
+        control_height = self.control_height
+
+        control_x = (screen_width - control_width) // 2
+        control_y = (screen_height - control_height) // 2
+
+        self.control_window.geometry(
+            f"{control_width}x{control_height}+{control_x}+{control_y}"
+        )
+
+        self.control_window.lift()
+
+    # ========================================================
+    # SERIAL THREAD
+    # ========================================================
+
+    def serial_reader(self):
+        time.sleep(2.0)
+
+        try:
+            self.serial_connection.reset_input_buffer()
+        except Exception:
+            pass
+
+        while not self.stop_event.is_set():
+            try:
+                line = self.serial_connection.readline()
+
+                if not line:
+                    continue
+
+                decoded = line.decode("utf-8", errors="ignore").strip()
+
+                if decoded:
+                    elapsed = time.time() - self.start_time
+                    self.line_queue.put((decoded, elapsed))
+
+            except Exception:
+                if not self.stop_event.is_set():
+                    self.line_queue.put(("__SERIAL_ERROR__", 0.0))
+                break
+
+    # ========================================================
+    # SERIAL PARSER
+    # ========================================================
+
+    def process_serial_queue(self):
+        processed = 0
+
+        while processed < 3000:
+            try:
+                line, elapsed = self.line_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            if line == "__SERIAL_ERROR__":
+                if self.control_window is not None:
+                    self.connection_var.set("Серийната връзка е прекъсната")
+                break
+
+            self.handle_serial_line(line, elapsed)
+            processed += 1
+
+        if not self.stop_event.is_set():
+            self.root.after(10, self.process_serial_queue)
+
+    def smooth_time(self, buffer, elapsed):
+        """
+        Семплите идват на равни интервали (50 Hz), но USB ги доставя
+        на групи. Поддържаме собствен часовник, който следва времето
+        на получаване бавно - така пиковете не "треперят" във времето.
+        """
+        clock = buffer["clock"]
+
+        if clock is None or abs(elapsed - clock) > 0.5:
+            clock = elapsed
+        else:
+            clock += 1.0 / RAW_SAMPLE_RATE
+            clock += CLOCK_GAIN * (elapsed - clock)
+
+        buffer["clock"] = clock
+        return clock
+
+    def handle_serial_line(self, line, elapsed):
+        """
+        Очаквани Arduino редове:
+
+        pulseN_raw:512      (50 Hz)  <- ползва се
+        pulseN_rr / _bpm             <- игнорират се (IBI/BPM се смятат тук)
+        nir:12345
+        """
+
+        if not line or ":" not in line:
+            return
+
+        prefix, value_text = line.split(":", 1)
+        prefix = prefix.strip().lower()
+
+        try:
+            value = float(value_text.strip())
+        except ValueError:
+            return
+
+        if prefix == "nir":
+            nir_time.append(elapsed)
+            nir_data.append(value)
+
+            if self.save_enabled:
+                nir_log.append((round(elapsed, 3), value))
+
+            return
+
+        parts = prefix.split("_")
+
+        if len(parts) != 2:
+            return
+
+        sensor_name, signal_name = parts
+
+        if sensor_name not in pulse_buffers or signal_name != "raw":
+            return
+
+        buffer = pulse_buffers[sensor_name]
+        sample_time = self.smooth_time(buffer, elapsed)
+
+        if self.save_enabled:
+            buffer["log_raw"].append(
+                (round(sample_time, 3), int(round(value)))
+            )
+
+        if value < RAW_DROP_THRESHOLD:
+            if buffer["last_good_raw"] is None:
+                return
+            value = buffer["last_good_raw"]
+        else:
+            buffer["last_good_raw"] = value
+
+        buffer["raw_time"].append(sample_time)
+        buffer["raw_data"].append(value)
+
+        # средно RAW от началото
+        buffer["raw_sum"] += value
+        buffer["raw_count"] += 1
+
+        result = buffer["detector"].update(value, sample_time)
+
+        if result is not None:
+            peak_time, ibi, bpm = result
+
+            buffer["ibi_time"].append(peak_time)
+            buffer["ibi_data"].append(ibi)
+            buffer["bpm_time"].append(peak_time)
+            buffer["bpm_data"].append(bpm)
+
+            # средно IBI / BPM от началото
+            buffer["ibi_sum"] += ibi
+            buffer["ibi_count"] += 1
+            buffer["bpm_sum"] += bpm
+            buffer["bpm_count"] += 1
+
+            if self.save_enabled:
+                buffer["log_beats"].append(
+                    (round(peak_time, 3), round(ibi, 1), round(bpm, 1))
+                )
+
+    # ========================================================
+    # ЗАПИС НА ДАННИТЕ (EXCEL / CSV) - ВСИЧКО В ЕДИН ЛИСТ
+    # ========================================================
+
+    def build_tables(self):
+        tables = []
+
+        for index, sensor_name in enumerate(
+            ("pulse1", "pulse2", "pulse3"), start=1
+        ):
+            buffer = pulse_buffers[sensor_name]
+
+            tables.append((
+                f"Pulse {index} Raw",
+                ["Time_s", "Raw"],
+                list(buffer["log_raw"])
+            ))
+
+            tables.append((
+                f"Pulse {index} Beats",
+                ["Time_s", "IBI_ms", "BPM"],
+                list(buffer["log_beats"])
+            ))
+
+        tables.append((
+            "AS7341 NIR",
+            ["Time_s", "NIR"],
+            list(nir_log)
+        ))
+
+        return tables
+
+    def build_combined_rows(self, tables):
+        """
+        Слепва всички таблици в един лист - една до друга,
+        с празна колона между тях.
+        Ред 1 = име на блока, ред 2 = заглавия на колоните.
+        """
+        title_row = []
+        header_row = []
+
+        for i, (title, headers, rows) in enumerate(tables):
+            if i > 0:
+                title_row.append(None)
+                header_row.append(None)
+
+            title_row.append(title)
+            title_row.extend([None] * (len(headers) - 1))
+            header_row.extend(headers)
+
+        max_rows = max((len(rows) for _, _, rows in tables), default=0)
+        body = []
+
+        for r in range(max_rows):
+            line = []
+
+            for i, (title, headers, rows) in enumerate(tables):
+                if i > 0:
+                    line.append(None)
+
+                if r < len(rows):
+                    line.extend(rows[r])
+                else:
+                    line.extend([None] * len(headers))
+
+            body.append(line)
+
+        return [title_row, header_row] + body
+
+    def save_data(self):
+        """Връща (успех, път_или_грешка)."""
+        if not self.save_enabled:
+            return True, ""
+
+        try:
+            os.makedirs(self.save_folder, exist_ok=True)
+
+            tables = self.build_tables()
+            all_rows = self.build_combined_rows(tables)
+            base_name = f"Multi_Sensor_{self.session_stamp}"
+
+            if self.excel_available:
+                from openpyxl import Workbook
+
+                workbook = Workbook(write_only=True)
+                sheet = workbook.create_sheet(title="Data")
+                sheet.freeze_panes = "A3"      # заглавията остават видими
+
+                for row in all_rows:
+                    sheet.append(row)
+
+                path = os.path.join(self.save_folder, base_name + ".xlsx")
+                workbook.save(path)
+
+            else:
+                path = os.path.join(self.save_folder, base_name + ".csv")
+
+                with open(path, "w", newline="", encoding="utf-8") as csv_file:
+                    csv.writer(csv_file).writerows(all_rows)
+
+            return True, path
+
+        except Exception as error:
+            return False, str(error)
+
+    def save_now(self):
+        ok, info = self.save_data()
+
+        if ok:
+            messagebox.showinfo(
+                "Данните са запазени",
+                f"Записано в:\n{info}",
+                parent=self.control_window
+            )
+        else:
+            messagebox.showerror(
+                "Грешка при запис",
+                (
+                    f"{info}\n\n"
+                    "Ако файлът е отворен в Excel, затворете го и опитайте пак."
+                ),
+                parent=self.control_window
+            )
+
+    # ========================================================
+    # СТИЛ НА MATPLOTLIB ОСИ
+    # ========================================================
+
+    def style_axis(self, axis):
+        axis.set_facecolor(PLOT_BG)
+        axis.tick_params(colors=TEXT, labelsize=8)
+
+        for spine in axis.spines.values():
+            spine.set_color(BORDER)
+
+        axis.xaxis.label.set_color(TEXT)
+        axis.yaxis.label.set_color(TEXT)
+        axis.title.set_color(TEXT)
+
+        axis.grid(True, color=BORDER, alpha=0.35, linewidth=0.7)
+
+    def draw_series(
+        self, axis, times, values, min_time, view_now,
+        color, label, min_span, markers=True, extend=True
+    ):
+        """
+        Рисува непрекъсната линия във видимия прозорец и мащабира Y оста
+        към данните. Паузите между удари не се прекъсват, а последната
+        стойност се продължава с пунктир до текущото време.
+        """
+        if len(times) == 0:
+            return False
+
+        t = np.asarray(times, dtype=float)
+        y = np.asarray(values, dtype=float)
+
+        mask = (t >= min_time) & (t <= view_now)
+        t = t[mask]
+        y = y[mask]
+
+        if len(t) == 0:
+            return False
+
+        autoscale_y(axis, y, min_span)
+
+        axis.plot(
+            t, y,
+            color=color, linewidth=1.6,
+            marker="o" if markers else None,
+            markersize=3, label=label
+        )
+
+        if extend and t[-1] < view_now:
+            axis.plot(
+                [t[-1], view_now], [y[-1], y[-1]],
+                color=color, linewidth=1.0, linestyle=":"
+            )
+
+        legend = axis.legend(
+            loc="upper right", fontsize=8,
+            facecolor=PANEL_LIGHT, edgecolor=BORDER
+        )
+
+        for legend_text in legend.get_texts():
+            legend_text.set_color(TEXT)
+
+        return True
+
+    def draw_waiting_text(self, axis, text):
+        axis.text(
+            0.5, 0.5, text,
+            transform=axis.transAxes,
+            ha="center", va="center", color=MUTED, fontsize=10
+        )
+
+    # ========================================================
+    # ОБНОВЯВАНЕ НА PULSE ПРОЗОРЕЦ
+    # ========================================================
+
+    def update_pulse_window(self, sensor_name, view_now):
+        if sensor_name not in self.pulse_windows:
+            return
+
+        ui = self.pulse_windows[sensor_name]
+        buffer = pulse_buffers[sensor_name]
+
+        ibi_axis = ui["ibi_axis"]
+        bpm_axis = ui["bpm_axis"]
+        accent_color = ui["accent_color"]
+
+        min_time, max_time = get_window_limits(view_now, WINDOW_SECONDS)
+
+        # ---------------- IBI графика ----------------
+
+        ibi_axis.clear()
+        self.style_axis(ibi_axis)
+        ibi_axis.set_xlim(min_time, max_time)
+        ibi_axis.set_ylim(400, 1200)
+        ibi_axis.set_title(
+            "IBI - интервал между удари",
+            loc="left", fontsize=10, fontweight="bold"
+        )
+        ibi_axis.set_ylabel("IBI (ms)")
+
+        has_ibi = self.draw_series(
+            ibi_axis, buffer["ibi_time"], buffer["ibi_data"],
+            min_time, view_now, accent_color, "IBI", MIN_SPAN_IBI
+        )
+
+        if not has_ibi:
+            self.draw_waiting_text(
+                ibi_axis, "Очакват се удари - поставете пръст върху сензора"
+            )
+
+        # ---------------- BPM графика ----------------
+
+        bpm_axis.clear()
+        self.style_axis(bpm_axis)
+        bpm_axis.set_xlim(min_time, max_time)
+        bpm_axis.set_ylim(40, 180)
+        bpm_axis.set_title(
+            "BPM (изчислен в Python)",
+            loc="left", fontsize=10, fontweight="bold"
+        )
+        bpm_axis.set_xlabel("Време (s)")
+        bpm_axis.set_ylabel("BPM")
+
+        self.draw_series(
+            bpm_axis, buffer["bpm_time"], buffer["bpm_data"],
+            min_time, view_now, accent_color, "BPM", MIN_SPAN_BPM
+        )
+
+        # ---------------- Показатели (средно от началото) ----------------
+
+        if buffer["bpm_count"] > 0:
+            ui["bpm_var"].set(
+                f"{buffer['bpm_sum'] / buffer['bpm_count']:.0f}"
+            )
+        else:
+            ui["bpm_var"].set("--")
+
+        if buffer["ibi_count"] > 0:
+            ui["ibi_var"].set(
+                f"{buffer['ibi_sum'] / buffer['ibi_count']:.0f}"
+            )
+        else:
+            ui["ibi_var"].set("--")
+
+        if buffer["raw_count"] > 0:
+            ui["raw_var"].set(
+                f"{buffer['raw_sum'] / buffer['raw_count']:.0f}"
+            )
+        else:
+            ui["raw_var"].set("--")
+
+        ui["canvas"].draw_idle()
+
+    # ========================================================
+    # ОБНОВЯВАНЕ НА NIR ПРОЗОРЕЦ
+    # ========================================================
+
+    def update_nir_window(self, view_now):
+        self.nir_axis.clear()
+        self.style_axis(self.nir_axis)
+
+        min_time, max_time = get_window_limits(view_now, WINDOW_SECONDS)
+
+        self.nir_axis.set_xlim(min_time, max_time)
+        self.nir_axis.set_title(
+            "AS7341 NIR спектрален канал",
+            loc="left", fontsize=11, fontweight="bold"
+        )
+        self.nir_axis.set_xlabel("Време (s)")
+        self.nir_axis.set_ylabel("NIR intensity")
+
+        has_data = self.draw_series(
+            self.nir_axis, nir_time, nir_data,
+            min_time, view_now, CYAN, "NIR", MIN_SPAN_NIR,
+            markers=False, extend=False
+        )
+
+        if not has_data:
+            self.draw_waiting_text(
+                self.nir_axis,
+                "Очакват се данни от AS7341\nArduino формат: nir:стойност"
+            )
+
+        _, nir_value = latest_point(nir_time, nir_data, view_now)
+        self.nir_value_var.set(
+            f"{nir_value:.0f}" if nir_value is not None else "--"
+        )
+
+        self.nir_canvas.draw_idle()
+
+    # ========================================================
+    # ГЛАВНО GUI ОБНОВЯВАНЕ
+    # ========================================================
+
+    def update_gui(self):
+        if self.stop_event.is_set():
+            return
+
+        now = time.time() - self.start_time
+        view_now = now - DISPLAY_DELAY_S
+
+        self.update_pulse_window("pulse1", view_now)
+        self.update_pulse_window("pulse2", view_now)
+        self.update_pulse_window("pulse3", view_now)
+        self.update_nir_window(view_now)
+
+        self.root.after(int(1000 / PLOT_FPS), self.update_gui)
+
+    # ========================================================
+    # ЗАТВАРЯНЕ НА ПРОГРАМАТА (със запис на данните)
+    # ========================================================
+
+    def close_application(self):
+        if self.closing:
+            return
+
+        self.closing = True
+        self.stop_event.set()
+
+        if self.serial_connection is not None:
+            try:
+                self.serial_connection.close()
+            except Exception:
+                pass
+
+        if self.reader_thread is not None:
+            try:
+                self.reader_thread.join(timeout=0.5)
+            except Exception:
+                pass
+
+        if self.save_enabled:
+            ok, info = self.save_data()
+
+            try:
+                if ok:
+                    messagebox.showinfo(
+                        "Данните са запазени",
+                        f"Записано в:\n{info}"
+                    )
+                else:
+                    messagebox.showerror(
+                        "Грешка при запис",
+                        (
+                            f"Данните не бяха запазени.\n\n{info}\n\n"
+                            "Ако файлът е отворен в Excel, затворете го."
+                        )
+                    )
+            except Exception:
+                pass
+
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+
+
+# ============================================================
+# СТАРТИРАНЕ
+# ============================================================
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    application = MultiSensorMonitor(root)
+    root.mainloop()
