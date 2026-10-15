@@ -663,7 +663,7 @@ class MultiSensorMonitor:
                 "Автоматично разположение:\n"
                 "горе: Pulse 1 / Pulse 2\n"
                 "долу: Pulse 3 / AS7341 NIR\n"
-                f"Забавяне на показването: {DISPLAY_DELAY_S:.1f} s"
+                f"Забавяне на графиката: {DISPLAY_DELAY_S:.1f} s" 
             ),
             bg=BG, fg=MUTED, font=("Segoe UI", 10), justify="center"
         ).pack(pady=(8, 10))
