@@ -1,0 +1,136 @@
+#include <Wire.h>
+#include <Adafruit_AS7341.h>
+
+Adafruit_AS7341 as7341;
+
+// ---------- Настройки ----------
+const uint8_t PULSE_PINS[3] = {A0, A1, A2};
+const char*   PULSE_NAMES[3] = {"pulse1", "pulse2", "pulse3"};
+
+const unsigned long DETECT_INTERVAL_US = 2000;   // 500 Hz за детекция на удари
+const uint8_t       RAW_SEND_EVERY     = 10;     // 500/10 = 50 Hz към Python
+
+// ---------- Детектор на удари (по алгоритъма на PulseSensor) ----------
+struct PulseChannel {
+  int  P = 512, T = 512, thresh = 530, amp = 0;
+  int  IBI = 600;
+  int  rate[10];
+  bool pulse = false, firstBeat = true, secondBeat = false;
+  unsigned long lastBeat = 0;
+  float bpm = 0;
+  bool newBeat = false;
+
+  void update(int signal, unsigned long now) {
+    unsigned long N = now - lastBeat;
+
+    if (signal < thresh && N > (unsigned long)(IBI / 5) * 3) {
+      if (signal < T) T = signal;
+    }
+    if (signal > thresh && signal > P) P = signal;
+
+    if (N > 250) {
+      if (signal > thresh && !pulse && N > (unsigned long)(IBI / 5) * 3) {
+        pulse = true;
+        IBI = now - lastBeat;
+        lastBeat = now;
+
+        if (secondBeat) {
+          secondBeat = false;
+          for (int i = 0; i < 10; i++) rate[i] = IBI;
+        }
+        if (firstBeat) {
+          firstBeat = false;
+          secondBeat = true;
+          return;                       // първият интервал се хвърля
+        }
+
+        long sum = 0;
+        for (int i = 0; i < 9; i++) { rate[i] = rate[i + 1]; sum += rate[i]; }
+        rate[9] = IBI;
+        sum += rate[9];
+        bpm = 60000.0f / (sum / 10.0f);
+        newBeat = true;
+      }
+    }
+
+    if (signal < thresh && pulse) {
+      pulse = false;
+      amp = P - T;
+      thresh = amp / 2 + T;
+      P = thresh;
+      T = thresh;
+    }
+
+    if (N > 2500) {                     // няма пулс
+      thresh = 530; P = 512; T = 512;
+      lastBeat = now;
+      firstBeat = true; secondBeat = false;
+      bpm = 0;
+    }
+  }
+};
+
+PulseChannel ch[3];
+
+// ---------- Изпращане ----------
+void sendValue(const char* name, const char* sig, float v, uint8_t dec = 0) {
+  Serial.print(name);
+  Serial.print('_');
+  Serial.print(sig);
+  Serial.print(':');
+  Serial.println(v, dec);
+}
+
+void setup() {
+  Serial.begin(230400);
+  Wire.begin();
+
+  if (!as7341.begin()) {
+    Serial.println("ERR:AS7341 not found");   // Python го игнорира (няма валидно число)
+    while (1);
+  }
+  // Интеграция ~ (ATIME+1)*(ASTEP+1)*2.78us ≈ 50 ms на цикъл
+  as7341.setATIME(29);
+  as7341.setASTEP(599);
+  as7341.setGain(AS7341_GAIN_16X);
+  as7341.startReading();                      // неблокиращо четене
+}
+
+void loop() {
+  static unsigned long lastTickUs = 0;
+  static uint8_t tick = 0;
+
+  // --- NIR (неблокиращо, ~10 Hz) ---
+  if (as7341.checkReadingProgress()) {
+    uint16_t nirValue = as7341.getChannel(AS7341_CHANNEL_NIR);
+    Serial.print("nir:");
+    Serial.println(nirValue);
+    as7341.startReading();
+  }
+
+  // --- Pulse сензори на 500 Hz ---
+  unsigned long nowUs = micros();
+  if (nowUs - lastTickUs < DETECT_INTERVAL_US) return;
+  lastTickUs += DETECT_INTERVAL_US;
+  if (nowUs - lastTickUs > 10 * DETECT_INTERVAL_US) lastTickUs = nowUs;  // догонване
+
+  unsigned long nowMs = millis();
+  int raw[3];
+
+  for (int i = 0; i < 3; i++) {
+    raw[i] = analogRead(PULSE_PINS[i]);
+    ch[i].update(raw[i], nowMs);
+
+    if (ch[i].newBeat) {
+      ch[i].newBeat = false;
+      sendValue(PULSE_NAMES[i], "rr",  ch[i].IBI, 0);
+      sendValue(PULSE_NAMES[i], "bpm", ch[i].bpm, 1);
+    }
+  }
+
+  if (++tick >= RAW_SEND_EVERY) {
+    tick = 0;
+    for (int i = 0; i < 3; i++) sendValue(PULSE_NAMES[i], "raw", raw[i], 0);
+  }
+}
+
